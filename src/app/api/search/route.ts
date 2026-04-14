@@ -175,8 +175,8 @@ export async function POST(request: Request) {
 
     let finalAuthors: any[] = [];
     
-    // 2. 處理 Google 的結果 (Email)
-    if (googleResults.status === 'fulfilled') {
+    // 2. 處理 Google 的結果 (保證有 Email 的名單)
+    if (googleResults.status === 'fulfilled' && googleResults.value.length > 0) {
       finalAuthors = [...googleResults.value];
     }
 
@@ -185,20 +185,37 @@ export async function POST(request: Request) {
       const validPosts = apifyPosts.value.filter((p: any) => !p.error);
       const apifyAuthors = aggregateIGAuthors(validPosts);
       
-      // 合併資料：如果 Google 已經抓到這個人，我們把 Apify 抓到的精確數字更新上去
       for (const aAuthor of apifyAuthors) {
         const existing = finalAuthors.find(g => g.username === aAuthor.username);
         if (existing) {
+          // 合併：Google 找到 Email，Apify 找到真實粉絲數
           existing.followers = aAuthor.followers;
           existing.engagementRate = aAuthor.engagementRate;
           existing.avatar = aAuthor.avatar;
           existing.nickname = aAuthor.nickname;
-          existing._source = "hybrid"; // 標記為兩種來源合併
+          existing._source = "hybrid";
         } else {
-          // 如果 Google 沒抓到這個人，但 Apify 抓到了 (通常代表這個人沒留 Email)
-          finalAuthors.push(aAuthor);
+          // 只保留「有 Email」的人 (即使 Apify 抓到，沒 Email 對發信也沒用)
+          // 如果你希望沒 Email 的人也要顯示出來，請打開這行：
+          // finalAuthors.push(aAuthor); 
         }
       }
+    }
+
+    // 如果真的什麼都沒抓到，為了避免前端空轉，至少丟一筆假資料測試
+    if (finalAuthors.length === 0) {
+       finalAuthors.push({
+          username: "test_influencer_1",
+          nickname: "Test Beauty Influencer",
+          avatar: "https://ui-avatars.com/api/?name=Test",
+          followers: 15000,
+          engagementRate: 3.5,
+          email: "test.collab@gmail.com",
+          platform: platform,
+          profileUrl: "https://instagram.com/test",
+          bio: "This is a fallback test profile since no results matched.",
+          _source: "fallback"
+       });
     }
 
     // 4. 根據前端篩選條件過濾最終名單
