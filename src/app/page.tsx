@@ -93,7 +93,7 @@ export default function Home() {
 
   const handleSearch = async (searchTerm?: string, fromHistory?: SearchHistory) => {
     let finalSearchTerm = searchTerm;
-    let searchFilters = {
+    let searchFilters: any = {
       minFollowers: parseInt(minFollowers) || 0,
       maxFollowers: parseInt(maxFollowers) || 0,
       minEngagement: parseFloat(minEngagement) || 0,
