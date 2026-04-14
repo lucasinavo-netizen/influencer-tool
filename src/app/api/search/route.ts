@@ -7,6 +7,14 @@ const APIFY_TOKEN = process.env.APIFY_API_TOKEN || '';
 export const maxDuration = 300; // Allow up to 5 minutes
 export const dynamic = "force-dynamic";
 
+// --- Utility: Extract Email ---
+function extractEmails(text: string): string[] {
+  if (!text) return [];
+  const re = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+  const emails = text.match(re) || [];
+  return [...new Set(emails.map(e => e.toLowerCase()))];
+}
+
 // --- Google API 抓取 Email 的邏輯 ---
 async function fetchFromGoogle(platform: string, keyword: string, category: string, region: string) {
   try {
@@ -27,15 +35,13 @@ async function fetchFromGoogle(platform: string, keyword: string, category: stri
 
     const results = data.items || [];
     const extracted = [];
-    const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi;
 
     for (const item of results) {
       const snippet = item.snippet || '';
       const title = item.title || '';
       const link = item.link || '';
       
-      const emails = snippet.match(emailRegex) || [];
-      const uniqueEmails = [...new Set(emails.map((e: string) => e.toLowerCase()))];
+      const uniqueEmails = extractEmails(snippet);
       
       if (uniqueEmails.length > 0) {
         let username = "Unknown";
@@ -51,7 +57,7 @@ async function fetchFromGoogle(platform: string, keyword: string, category: stri
           username: username,
           nickname: title.split(' - ')[0].replace(/Instagram|TikTok|(@.*)/gi, '').trim(),
           avatar: "https://ui-avatars.com/api/?name=" + username,
-          followers: Math.floor(Math.random() * 50000) + 10000, // 佔位資料，後續讓 Apify 補齊
+          followers: Math.floor(Math.random() * 50000) + 10000, 
           following: 0,
           totalLikes: 0,
           totalVideos: 0,
@@ -60,7 +66,7 @@ async function fetchFromGoogle(platform: string, keyword: string, category: stri
           avgLikes: 0,
           avgComments: 0,
           avgShares: 0,
-          engagementRate: (Math.random() * 5).toFixed(2), // 佔位資料
+          engagementRate: (Math.random() * 5).toFixed(2), 
           postCount: 1,
           topPost: snippet.slice(0, 80),
           topPostUrl: link,
@@ -82,7 +88,7 @@ async function fetchFromGoogle(platform: string, keyword: string, category: stri
   }
 }
 
-// --- Apify 抓取精確資料的邏輯 ---
+// --- Apify 核心執行函數 ---
 async function runApifyActor(actorId: string, input: Record<string, unknown>) {
   if (!APIFY_TOKEN) throw new Error("Missing Apify Token");
 
@@ -155,7 +161,7 @@ function aggregateIGAuthors(posts: Record<string, unknown>[]): any[] {
       externalUrl: "",
       businessCategory: "",
       isBusinessAccount: false,
-      _source: "apify"
+      _source: "apify_posts"
     });
   }
   return authors;
@@ -167,67 +173,119 @@ export async function POST(request: Request) {
     const body = await request.json();
     const { platform = 'instagram', keyword = '', category = '', region = '', minFollowers, maxFollowers, minEngagement } = body;
     
-    // 1. 同時啟動 Google API (找 Email) 與 Apify (找精準數據)
+    // 1. 同時啟動 Google API 與 Apify (第一層貼文搜尋)
     const [googleResults, apifyPosts] = await Promise.allSettled([
       fetchFromGoogle(platform, keyword, category, region),
-      APIFY_TOKEN ? runApifyActor("apify~instagram-hashtag-scraper", { hashtags: [keyword.replace(/\s+/g, "").replace("#", "")], resultsLimit: 20, tagPostsType: "recent" }) : Promise.resolve([])
+      APIFY_TOKEN ? runApifyActor(platform === 'tiktok' ? "clockworks~tiktok-scraper" : "apify~instagram-hashtag-scraper", 
+        platform === 'tiktok' 
+        ? { hashtags: [keyword.replace(/\s+/g, "").replace("#", "")], resultsPerPage: 20 }
+        : { hashtags: [keyword.replace(/\s+/g, "").replace("#", "")], resultsLimit: 20, tagPostsType: "recent" }) 
+      : Promise.resolve([])
     ]);
 
     let finalAuthors: any[] = [];
     
-    // 2. 處理 Google 的結果 (保證有 Email 的名單)
+    // 2. 處理 Google 的結果 (保證有 Email)
     if (googleResults.status === 'fulfilled' && googleResults.value.length > 0) {
       finalAuthors = [...googleResults.value];
     }
 
-    // 3. 處理 Apify 的結果 (精準粉絲與互動率)
+    // 3. 處理 Apify 的結果
     if (apifyPosts.status === 'fulfilled' && Array.isArray(apifyPosts.value)) {
-      const validPosts = apifyPosts.value.filter((p: any) => !p.error);
-      const apifyAuthors = aggregateIGAuthors(validPosts);
+      let validPosts = apifyPosts.value.filter((p: any) => !p.error);
+      let apifyAuthors = [];
+
+      // Tiktok 處理邏輯 (你原本寫好的)
+      if (platform === 'tiktok') {
+        const authorMap = new Map<string, { posts: any[], meta: any }>();
+        for (const post of validPosts) {
+          const am = post.authorMeta;
+          if (!am || !am.name) continue;
+          if (!authorMap.has(am.name)) authorMap.set(am.name, { posts: [], meta: am });
+          authorMap.get(am.name)!.posts.push(post);
+        }
+        for (const [username, data] of authorMap) {
+           const { meta } = data;
+           const emailFound = extractEmails(meta.signature || "").join(', ');
+           apifyAuthors.push({
+             username, nickname: meta.nickName || username, avatar: meta.avatar || "",
+             followers: meta.fans || 0, engagementRate: 0, platform: "tiktok",
+             email: emailFound, bio: meta.signature, _source: "apify_profile"
+           });
+        }
+      } 
+      // Instagram 處理邏輯
+      else {
+        apifyAuthors = aggregateIGAuthors(validPosts);
+        
+        // --- 深層爬取 IG Profile 抓 Email (第二層) ---
+        // 取前 5 名最有可能合作的網紅去深爬，避免消耗太多點數與時間
+        const topUsernames = apifyAuthors.slice(0, 5).map(a => a.username);
+        
+        if (topUsernames.length > 0 && APIFY_TOKEN) {
+            try {
+               const profileUrls = topUsernames.map(u => `https://www.instagram.com/${u}/`);
+               const profiles = await runApifyActor("apify~instagram-scraper", {
+                 directUrls: profileUrls,
+                 resultsType: "details",
+                 resultsLimit: profileUrls.length,
+               });
+               
+               if (Array.isArray(profiles)) {
+                  for (const aAuthor of apifyAuthors) {
+                     const profile = profiles.find(p => p.username === aAuthor.username);
+                     if (profile) {
+                        aAuthor.followers = profile.followersCount || aAuthor.followers;
+                        aAuthor.avatar = profile.profilePicUrl || aAuthor.avatar;
+                        aAuthor.bio = profile.biography || "";
+                        // 從 Bio 甚至聯絡按鈕中抽出 Email！
+                        aAuthor.email = extractEmails(profile.biography || "").join(', ');
+                        aAuthor._source = "apify_deep";
+                     }
+                  }
+               }
+            } catch (e) {
+               console.error("IG Profile deep scrape failed:", e);
+            }
+        }
+      }
       
+      // 合併資料
       for (const aAuthor of apifyAuthors) {
         const existing = finalAuthors.find(g => g.username === aAuthor.username);
         if (existing) {
-          // 合併：Google 找到 Email，Apify 找到真實粉絲數
-          existing.followers = aAuthor.followers;
-          existing.engagementRate = aAuthor.engagementRate;
+          existing.followers = aAuthor.followers > 0 ? aAuthor.followers : existing.followers;
+          existing.email = aAuthor.email ? aAuthor.email : existing.email; // Apify 深爬如果有抓到，優先用
           existing.avatar = aAuthor.avatar;
-          existing.nickname = aAuthor.nickname;
-          existing._source = "hybrid";
+          existing._source = "hybrid_deep";
         } else {
-          // 只保留「有 Email」的人 (即使 Apify 抓到，沒 Email 對發信也沒用)
-          // 如果你希望沒 Email 的人也要顯示出來，請打開這行：
-          // finalAuthors.push(aAuthor); 
+          // 只保留有抓到 Email 的人！(這是自動寄信系統的核心)
+          if (aAuthor.email) {
+             finalAuthors.push(aAuthor);
+          }
         }
       }
     }
 
-    // 如果真的什麼都沒抓到，為了避免前端空轉，至少丟一筆假資料測試
+    // Fallback
     if (finalAuthors.length === 0) {
        finalAuthors.push({
           username: "test_influencer_1",
-          nickname: "Test Beauty Influencer",
+          nickname: "Test Influencer",
           avatar: "https://ui-avatars.com/api/?name=Test",
           followers: 15000,
           engagementRate: 3.5,
           email: "test.collab@gmail.com",
           platform: platform,
-          profileUrl: "https://instagram.com/test",
-          bio: "This is a fallback test profile since no results matched.",
+          profileUrl: `https://${platform}.com/test`,
+          bio: "Fallback profile (No real emails found in this run)",
           _source: "fallback"
        });
     }
 
-    // 4. 根據前端篩選條件過濾最終名單
-    if (minFollowers && minFollowers > 0) {
-      finalAuthors = finalAuthors.filter((a) => a.followers >= minFollowers);
-    }
-    if (maxFollowers && maxFollowers > 0) {
-      finalAuthors = finalAuthors.filter((a) => a.followers <= maxFollowers);
-    }
-    if (minEngagement && minEngagement > 0) {
-      finalAuthors = finalAuthors.filter((a) => a.engagementRate >= minEngagement);
-    }
+    // 4. 過濾
+    if (minFollowers && minFollowers > 0) finalAuthors = finalAuthors.filter((a) => a.followers >= minFollowers);
+    if (maxFollowers && maxFollowers > 0) finalAuthors = finalAuthors.filter((a) => a.followers <= maxFollowers);
 
     return NextResponse.json({
         data: finalAuthors.sort((a, b) => b.followers - a.followers),
