@@ -173,14 +173,18 @@ export async function POST(request: Request) {
     const body = await request.json();
     const { platform = 'instagram', keyword = '', category = '', region = '', minFollowers, maxFollowers, minEngagement } = body;
     
-    // 1. 同時啟動 Google API 與 Apify (第一層貼文搜尋)
+    // 1. 同時啟動 Google API 與 Apify 
+    // Instagram 改用 search + profile scraper，而不是 hashtag scraper（更精準）
     const [googleResults, apifyPosts] = await Promise.allSettled([
       fetchFromGoogle(platform, keyword, category, region),
-      APIFY_TOKEN ? runApifyActor(platform === 'tiktok' ? "clockworks~tiktok-scraper" : "apify~instagram-hashtag-scraper", 
-        platform === 'tiktok' 
-        ? { hashtags: [keyword.replace(/\s+/g, "").replace("#", "")], resultsPerPage: 20 }
-        : { hashtags: [keyword.replace(/\s+/g, "").replace("#", "")], resultsLimit: 20, tagPostsType: "recent" }) 
-      : Promise.resolve([])
+      APIFY_TOKEN ? (platform === 'tiktok' 
+        ? runApifyActor("clockworks~tiktok-scraper", { hashtags: [keyword.replace(/\s+/g, "").replace("#", "")], resultsPerPage: 20 })
+        : runApifyActor("apify~instagram-search-scraper", { 
+            searchLimit: 30, 
+            searchResultType: "USER", 
+            searchQuery: keyword 
+          })
+      ) : Promise.resolve([])
     ]);
 
     let finalAuthors: any[] = [];
@@ -192,13 +196,13 @@ export async function POST(request: Request) {
 
     // 3. 處理 Apify 的結果
     if (apifyPosts.status === 'fulfilled' && Array.isArray(apifyPosts.value)) {
-      let validPosts = apifyPosts.value.filter((p: any) => !p.error);
+      let validResults = apifyPosts.value.filter((p: any) => !p.error);
       let apifyAuthors = [];
 
-      // Tiktok 處理邏輯 (你原本寫好的)
+      // Tiktok 處理邏輯 (保持不變)
       if (platform === 'tiktok') {
         const authorMap = new Map<string, { posts: any[], meta: any }>();
-        for (const post of validPosts) {
+        for (const post of validResults) {
           const am = post.authorMeta;
           if (!am || !am.name) continue;
           if (!authorMap.has(am.name)) authorMap.set(am.name, { posts: [], meta: am });
@@ -214,51 +218,42 @@ export async function POST(request: Request) {
            });
         }
       } 
-      // Instagram 處理邏輯
+      // Instagram 新邏輯：直接從 search 結果取得 user profile
       else {
-        apifyAuthors = aggregateIGAuthors(validPosts);
-        
-        // --- 深層爬取 IG Profile 抓 Email (第二層) ---
-        // 取前 15 名最有可能合作的網紅去深爬，提升 Email 獲取率
-        const topUsernames = apifyAuthors.slice(0, 15).map(a => a.username);
-        
-        if (topUsernames.length > 0 && APIFY_TOKEN) {
-            try {
-               const profileUrls = topUsernames.map(u => `https://www.instagram.com/${u}/`);
-               const profiles = await runApifyActor("apify~instagram-scraper", {
-                 directUrls: profileUrls,
-                 resultsType: "details",
-                 resultsLimit: profileUrls.length,
-               });
-               
-               if (Array.isArray(profiles)) {
-                  for (const aAuthor of apifyAuthors) {
-                     const profile = profiles.find(p => p.username === aAuthor.username);
-                     if (profile) {
-                        aAuthor.followers = profile.followersCount || aAuthor.followers;
-                        aAuthor.avatar = profile.profilePicUrl || aAuthor.avatar;
-                        aAuthor.bio = profile.biography || "";
-                        aAuthor.externalUrl = profile.externalUrl || "";
-                        aAuthor.businessCategory = profile.businessCategoryName || "";
-                        aAuthor.isBusinessAccount = profile.isBusinessAccount || false;
-                        aAuthor.verified = profile.verified || false;
-                        
-                        // 多重 Email 來源嘗試
-                        const emailSources = [
-                          profile.biography || "",
-                          profile.externalUrl || "",
-                          profile.publicEmail || ""
-                        ].join(" ");
-                        
-                        aAuthor.email = extractEmails(emailSources).join(', ');
-                        aAuthor._source = "apify_deep";
-                     }
-                  }
-               }
-            } catch (e) {
-               console.error("IG Profile deep scrape failed:", e);
-            }
+        // Search Scraper 回傳的已經是 user profiles，不需要再聚合
+        for (const user of validResults) {
+          if (!user.username) continue;
+          
+          apifyAuthors.push({
+            username: user.username,
+            nickname: user.fullName || user.username,
+            avatar: user.profilePicUrl || "",
+            followers: user.followersCount || 0,
+            following: user.followsCount || 0,
+            totalLikes: 0,
+            totalVideos: user.postsCount || 0,
+            verified: user.verified || false,
+            avgPlays: 0,
+            avgLikes: 0,
+            avgComments: 0,
+            avgShares: 0,
+            engagementRate: 0, // 稍後計算
+            postCount: user.postsCount || 0,
+            topPost: "",
+            topPostUrl: "",
+            platform: "instagram",
+            profileUrl: `https://www.instagram.com/${user.username}/`,
+            bio: user.biography || "",
+            email: extractEmails((user.biography || "") + " " + (user.externalUrl || "") + " " + (user.publicEmail || "")).join(', '),
+            externalUrl: user.externalUrl || "",
+            businessCategory: user.businessCategoryName || "",
+            isBusinessAccount: user.isBusinessAccount || false,
+            _source: "apify_search"
+          });
         }
+        
+        // Search Scraper 已經提供完整的 profile 資訊，不需要額外深爬
+        // 如果需要補充資訊（例如最新貼文），可以在這裡加入邏輯
       }
       
       // 合併資料
