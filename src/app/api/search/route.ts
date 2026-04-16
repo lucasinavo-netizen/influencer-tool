@@ -219,8 +219,8 @@ export async function POST(request: Request) {
         apifyAuthors = aggregateIGAuthors(validPosts);
         
         // --- 深層爬取 IG Profile 抓 Email (第二層) ---
-        // 取前 5 名最有可能合作的網紅去深爬，避免消耗太多點數與時間
-        const topUsernames = apifyAuthors.slice(0, 5).map(a => a.username);
+        // 取前 15 名最有可能合作的網紅去深爬，提升 Email 獲取率
+        const topUsernames = apifyAuthors.slice(0, 15).map(a => a.username);
         
         if (topUsernames.length > 0 && APIFY_TOKEN) {
             try {
@@ -238,8 +238,19 @@ export async function POST(request: Request) {
                         aAuthor.followers = profile.followersCount || aAuthor.followers;
                         aAuthor.avatar = profile.profilePicUrl || aAuthor.avatar;
                         aAuthor.bio = profile.biography || "";
-                        // 從 Bio 甚至聯絡按鈕中抽出 Email！
-                        aAuthor.email = extractEmails(profile.biography || "").join(', ');
+                        aAuthor.externalUrl = profile.externalUrl || "";
+                        aAuthor.businessCategory = profile.businessCategoryName || "";
+                        aAuthor.isBusinessAccount = profile.isBusinessAccount || false;
+                        aAuthor.verified = profile.verified || false;
+                        
+                        // 多重 Email 來源嘗試
+                        const emailSources = [
+                          profile.biography || "",
+                          profile.externalUrl || "",
+                          profile.publicEmail || ""
+                        ].join(" ");
+                        
+                        aAuthor.email = extractEmails(emailSources).join(', ');
                         aAuthor._source = "apify_deep";
                      }
                   }
@@ -257,12 +268,19 @@ export async function POST(request: Request) {
           existing.followers = aAuthor.followers > 0 ? aAuthor.followers : existing.followers;
           existing.email = aAuthor.email ? aAuthor.email : existing.email; // Apify 深爬如果有抓到，優先用
           existing.avatar = aAuthor.avatar;
+          existing.nickname = aAuthor.nickname || existing.nickname;
+          existing.bio = aAuthor.bio || existing.bio;
+          existing.externalUrl = aAuthor.externalUrl || existing.externalUrl;
+          existing.businessCategory = aAuthor.businessCategory || existing.businessCategory;
           existing._source = "hybrid_deep";
         } else {
-          // 只保留有抓到 Email 的人！(這是自動寄信系統的核心)
-          if (aAuthor.email) {
-             finalAuthors.push(aAuthor);
+          // 改進：即使沒有 Email 也保留，但標記為需要手動聯絡
+          // 至少提供 Instagram username、followers、engagement 等資訊
+          if (!aAuthor.email) {
+            aAuthor.email = ""; // 空的 Email，前端可以顯示「需要 DM 聯絡」
+            aAuthor.bio = (aAuthor.bio || "") + " [無公開 Email，可透過 IG DM 或查看主頁聯絡方式]";
           }
+          finalAuthors.push(aAuthor);
         }
       }
     }
